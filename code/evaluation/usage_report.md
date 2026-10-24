@@ -1,36 +1,42 @@
 # Usage Report — final full-dataset run
 
+This file is written by `python code/main.py` at the end of every full run over
+`dataset/deletion_requests.csv`, from the counters in `code/evaluation/last_run_usage.json`.
+
 ## Final run that produced `output.csv`
 
-Command: `python code/main.py` (518 requests from `dataset/deletion_requests.csv`).
-Raw counters written by the run: `code/evaluation/last_run_usage.json`.
+Command: `GHOST_AUDIT_PROVIDER=ollama python code/main.py --llm` · 518 requests · 17.7 s
 
 | Provider | Model | Model calls | Input tokens | Output tokens | Total tokens | Avg tokens / request | Est. cost | Est. cost / request |
 |---|---|---|---|---|---|---|---|---|
-| Anthropic | `claude-opus-5-5` (configured, optional) | 0 | 0 | 0 | 0 | 0 | $0.00 | $0.00 |
-| **Overall** | | **0** | **0** | **0** | **0** | **0** | **$0.00** | **$0.00** |
+| Local (Ollama) | `gemma4:e4b` | 10 | 16,684 | 3,355 | 20,039 | 38.7 | $0.0000 | $0.000000 |
+| **Overall** | | **10** | **16,684** | **3,355** | **20,039** | **38.7** | **$0.0000** | **$0.000000** |
 
-Runtime ≈ 2 seconds on a laptop.
+Prices used: $0.00 / $0.00 per million input / output tokens (`PRICES` in `code/ghost_audit/llm.py`,
+override with `GHOST_AUDIT_PRICE_IN` / `GHOST_AUDIT_PRICE_OUT`). Check them against the provider's current price list.
 
-The final run makes no model calls because every decision is deterministic:
+### By purpose
 
-- **Request intent:** the multilingual rules decided all 518 request texts confidently. The Claude fallback (`--llm`) is only called for texts the rules cannot decide.
-- **PDF evidence:** read with `pdfplumber`.
-- **Screenshot evidence:** read from a cached extraction (`code/ghost_audit/vision_cache/image_records.json`).
-- **Everything else:** identity resolution, evidence parsing, state reconstruction, policy and step ordering are plain Python.
-
-## One-time screenshot extraction (development, not part of the run)
-
-The 11 screenshots in `dataset/evidence/images/` were transcribed once into the cache during development. The coding agent did this (Claude Code running `claude-opus-5-5`, see `log.txt`), viewing each image, and the facts were written to the cache by hand-checked transcription.
-
-| Provider | Model | Images | Est. input tokens | Est. output tokens | Est. cost |
+| Purpose | Calls | Input tokens | Output tokens | Total tokens | Est. cost |
 |---|---|---|---|---|---|
-| Anthropic | `claude-opus-5-5` | 11 (12 views) | ≈ 19,000 (≈1,600 per image) | ≈ 4,500 | ≈ $0.17 at $4 / $20 per MTok |
+| intent | 10 | 16,684 | 3,355 | 20,039 | $0.0000 |
 
-These figures are estimates, because the extraction ran inside the coding session and not through the pipeline's metered client.
+### Intent cross-check
 
-To regenerate the cache through the API with metering, run `python code/main.py --refresh-vision`. It needs `pip install anthropic` and credentials. It makes one call per image (11 calls), and the counts land in `last_run_usage.json`.
+The model labelled 375 of 375 request texts. It agreed with the multilingual rules on 375 of them (100.0%). Disagreements: 0 (listed in `last_run_usage.json`; the rules decide confident texts, the model decides the rest).
 
-## Optional LLM path
+### Screenshot facts
 
-`python code/main.py --llm` sends only the request texts the rules cannot decide to `claude-opus-5-5`, using the low effort setting, a 256-token cap, and server-side refusal fallback. On the current dataset that is 0 texts, so it costs nothing. In the worst case (all 518 texts), it would be ≈ 518 × ~150 input + ~5 output tokens ≈ 80k tokens ≈ $0.37 total, or ≈ $0.0007 per request.
+Not re-extracted in this run; the cached facts were used. Cache provenance: Facts transcribed from dataset/evidence/images/*.png by a vision model (claude-opus-5-5) during development. Regenerate with: python code/main.py --refresh-vision
+
+## What the model is used for
+
+- **Request intent (`--llm`):** every request text is sent to the model in batches of 40, at temperature 0
+  (prompt: `LLM_SYSTEM` / `BATCH_PROMPT` in `code/ghost_audit/intent.py`). Nothing is cached, so these counts are
+  the calls this run really made.
+- **Screenshots (`--refresh-vision`):** one call per image in `dataset/evidence/images/`. The facts are cached in
+  `code/ghost_audit/vision_cache/image_records.json`, with a readable copy in `image_records.md`.
+- **Everything else** is plain Python: identity resolution, evidence parsing, state at `audit_at`, deletion-job
+  timing, policy and step ordering.
+
+Without a key or with no flags, the run is fully deterministic and makes 0 calls.

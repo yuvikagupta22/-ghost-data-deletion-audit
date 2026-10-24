@@ -2,8 +2,8 @@
 
 Screenshots are read once by a vision model and the result is cached in
 `vision_cache/image_records.json`, so audit runs are deterministic and free.
-`python code/main.py --refresh-vision` re-extracts every image with the Claude API
-(requires the `anthropic` package and an ANTHROPIC_API_KEY or `ant auth login`).
+`python code/main.py --refresh-vision` re-extracts every image with the configured model
+(Gemini via GEMINI_API_KEY, or Claude via the `anthropic` package; see llm.py).
 """
 import base64
 import json
@@ -38,13 +38,41 @@ def refresh(paths):
         data = base64.standard_b64encode(Path(path).read_bytes()).decode("utf-8")
         content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
                    {"type": "text", "text": PROMPT}]
-        text = llm.complete(content, max_tokens=4000, purpose="vision")
+        # generous cap: Gemini 2.5 counts its thinking tokens against the output limit
+        text = llm.complete(content, max_tokens=8192, purpose="vision", json_mode=True)
         m = re.search(r"\{.*\}", text or "", re.S)
-        if m:
-            cache[Path(path).name] = json.loads(m.group(0))
+        try:
+            entry = json.loads(m.group(0)) if m else None
+        except ValueError:
+            entry = None
+        if entry:
+            cache[Path(path).name] = entry
+        else:   # keep the previous facts rather than losing an image
+            print(f"vision: could not parse the model answer for {Path(path).name}; kept the cached facts")
+    cache["_note"] = (f"Facts extracted from dataset/evidence/images/*.png by {llm.provider()} {llm.model()} "
+                      "(python code/main.py --refresh-vision).")
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     CACHE.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_markdown(cache)
     return cache
+
+
+def write_markdown(cache=None):
+    """Readable copy of the cache (automated code review ignores .json files)."""
+    cache = cache if cache is not None else _load_cache()
+    lines = ["# Screenshot facts used by the audit", "", cache.get("_note", ""), "",
+             "Generated from `image_records.json`; edit neither by hand, re-run `--refresh-vision` instead.", ""]
+    for name, entry in sorted(cache.items()):
+        if name.startswith("_"):
+            continue
+        lines += [f"## {name}", "", "| resource_id | fields |", "|---|---|"]
+        for rec in entry.get("records", []):
+            fields = ", ".join(f"{k}={v}" for k, v in rec.get("fields", {}).items())
+            lines.append(f"| `{rec.get('resource_id')}` | {fields.replace('|', '/')} |")
+        if not entry.get("records"):
+            lines.append("| — | no resource ids visible |")
+        lines.append("")
+    CACHE.with_suffix(".md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def image_observations(path, eid, ftime, aliases, Observation, derive_state):
@@ -64,6 +92,8 @@ def image_observations(path, eid, ftime, aliases, Observation, derive_state):
         obs.append(Observation(eid, ftime, ftime, system, rid, state, keys, "screenshot:" + Path(path).stem))
         seen.add(rid)
     text = entry.get("text", "")
+    if isinstance(text, list):   # some models return one list item per visible line
+        text = "\n".join(map(str, text))
     for alias, rid in aliases.items():
         if rid in seen or not alias or not re.search(r"(?<![\w.])" + re.escape(alias) + r"(?![\w])", text):
             continue

@@ -39,10 +39,19 @@ class Observation:
     keys: set = field(default_factory=set)
     hint: str = ""          # record type / event / collection, used to classify the resource
     source: str = "file"    # file | activity | sql_absence
+    retain_until: object = None   # end of a stated retention period / legal hold, if the record shows one
 
 
 def _null(v):
     return v is None or (isinstance(v, str) and v.strip().lower() in ("", "null", "none", "-", "—"))
+
+
+def _retain_until(f):
+    for k in ("retention_until", "retained_until", "retain_until", "hold_until"):
+        t = parse_ts(f.get(k)) if isinstance(f.get(k), str) else None
+        if t:
+            return t
+    return None
 
 
 def _true(v):
@@ -163,7 +172,7 @@ def parse_json(path, eid, ftime):
             if isinstance(v, str) and RESOURCE_RE.fullmatch(v) and v != rid:
                 keys.add("res:" + v)
         obs.append(Observation(eid, ftime, parse_ts(ctx.get("ts")) or ftime, system, rid,
-                               derive_state(system, flat, hint), keys, hint))
+                               derive_state(system, flat, hint), keys, hint, retain_until=_retain_until(flat)))
     return obs
 
 
@@ -250,7 +259,7 @@ def parse_log(path, eid, ftime):
                 keys |= identifier_keys(v)
         keys |= trace_keys.get(d.get("trace_id"), set()) if d.get("trace_id") else set()
         obs.append(Observation(eid, ftime, parse_ts(d["_ts"]) or ftime, system, rid,
-                               derive_state(system, f, hint), keys, hint))
+                               derive_state(system, f, hint), keys, hint, retain_until=_retain_until(f)))
     return obs
 
 
@@ -303,7 +312,8 @@ def parse_sql(path, eid, ftime):
             for k, v in f.items():
                 if isinstance(v, str) and RESOURCE_RE.fullmatch(v) and v != rid:
                     keys.add("res:" + v)
-            obs.append(Observation(eid, ftime, ftime, system, rid, derive_state(system, f, hint), keys, hint))
+            obs.append(Observation(eid, ftime, ftime, system, rid, derive_state(system, f, hint), keys, hint,
+                                   retain_until=_retain_until(f)))
     con.close()
     return obs, (covered if full_capture else set())
 

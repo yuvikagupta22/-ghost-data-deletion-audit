@@ -12,6 +12,20 @@ LINK_RE = re.compile(r"linked (\S+) \(([^)]*)\) to (\S+) and (user_\d+)")
 STATUS_RESULT = {"COMPLETE": "SUCCESS", "PARTIALLY_COMPLETE": "PARTIAL", "NOT_STARTED": "FAILED"}
 ATTACH_RE = re.compile(r"confirmed (\S+) \(([^)]*)\) belongs only to (\S+) and (user_\d+)")
 
+# A deletion job runs one subject's policy actions after its account deletion at a fixed cadence,
+# so (action time - account deletion time) mod 60 s is the same for every job of one action kind.
+JOB_WINDOW = 6 * 3600       # policy actions follow the account deletion within a few hours
+JOB_MIN_SUPPORT = 3         # identifier-linked examples needed before a cadence is trusted
+JOB_MIN_SHARE = 0.2         # a residue must hold this share of the examples to count
+JOB_PEAK_RATIO = 4.0        # unsupervised: peak residue vs the mean of all 60 residues
+JOB_PEAK_MARGIN = 1.5       # unsupervised: peak vs the best residue outside the peak
+ID_TOKEN_RE = re.compile(r"\b[a-z_]+_\d+\b")
+
+
+def action_kind(activity):
+    """(resource kind, message template): completed policy actions and retries run on different cadences."""
+    return prefix_of(activity["resource_id"]), ID_TOKEN_RE.sub("X", activity["details"])
+
 
 class World:
     """Everything that is shared by all cases (loaded once)."""
@@ -98,13 +112,108 @@ class World:
         for _, rid, uid, _ in self.catalog:
             self.owners[rid].add(uid)
 
+    # ------------------------------------------------------------ deletion jobs
+    def _index_jobs(self):
+        """Deletion-worker activity: account deletion times, and the policy actions that follow them."""
+        self.account_deleted_at = defaultdict(list)   # account -> [time]
+        self.job_actions = defaultdict(list)          # resource -> [(time, activity_id, kind)]
+        for a in self.activities:
+            if a["source_system"] != "deletion_worker":
+                continue
+            t = parse_ts(a["event_time"])
+            if a["target_system"] == "account_service" and a["event_type"] == "DELETE_RECORD":
+                self.account_deleted_at[a["resource_id"]].append(t)
+            elif prefix_of(a["resource_id"]) not in (None, "account"):
+                self.job_actions[a["resource_id"]].append((t, a["activity_id"], action_kind(a)))
+        self._learn_cadence()
+
+    def _residues(self, accounts, actions):
+        for ta in accounts:
+            for t, aid, kind in actions:
+                d = (t - ta).total_seconds()
+                if 0 < d < JOB_WINDOW:
+                    yield kind, int(d) % 60, aid
+
+    def _learn_cadence(self):
+        """Learn, per action kind, the residues (seconds mod 60) that pair a policy action with its
+        account deletion.
+
+        Supervised first: identifier-linked subject -> account -> action pairs (never the activity-time
+        guesses). Kinds with no such pairs (an anonymized analytics profile carries no identifier) are
+        learned without labels: every action belongs to exactly one job, so pairing it with every
+        account deletion in the window piles the true residue into a sharp peak over uniform noise.
+        """
+        labelled = defaultdict(lambda: defaultdict(int))
+        for uid in {u for us in self.owners.values() for u in us}:
+            accts = [r for r, us in self.owners.items() if prefix_of(r) == "account" and uid in us
+                     and r in self.account_deleted_at]
+            if len(accts) != 1:
+                continue
+            for rid, us in self.owners.items():
+                if us == {uid} and rid in self.job_actions:
+                    for kind, res, _ in self._residues(self.account_deleted_at[accts[0]], self.job_actions[rid]):
+                        labelled[kind][res] += 1
+        unlabelled = defaultdict(lambda: defaultdict(int))
+        all_deletions = [t for ts in self.account_deleted_at.values() for t in ts]
+        for actions in self.job_actions.values():
+            for kind, res, _ in self._residues(all_deletions, actions):
+                unlabelled[kind][res] += 1
+        self.cadence, self.cadence_source = {}, {}
+        for kind in set(labelled) | set(unlabelled):
+            c = labelled.get(kind, {})
+            n = sum(c.values())
+            if n >= JOB_MIN_SUPPORT:
+                self.cadence[kind] = {r for r, k in c.items() if k / n >= JOB_MIN_SHARE}
+                self.cadence_source[kind] = "identifier-linked"
+                continue
+            c = unlabelled.get(kind, {})
+            if not c:
+                continue
+            peak = max(sorted(c), key=lambda r: c[r])
+            near = {peak, (peak - 1) % 60, (peak + 1) % 60}
+            outside = max((k for r, k in c.items() if r not in near), default=0)
+            if c[peak] >= JOB_MIN_SUPPORT and c[peak] >= JOB_PEAK_RATIO * sum(c.values()) / 60 \
+                    and c[peak] >= JOB_PEAK_MARGIN * outside:
+                self.cadence[kind] = {r for r in near if c.get(r, 0) >= 0.4 * c[peak]}
+                self.cadence_source[kind] = "unsupervised-peak"
+
+    def job_aligned(self, account, rid):
+        """Activity id of a policy action on `rid` that sits on `account`'s deletion-job cadence."""
+        for kind, res, aid in self._residues(self.account_deleted_at.get(account, ()), self.job_actions.get(rid, ())):
+            if res in self.cadence.get(kind, ()):
+                return aid
+        return None
+
+    def has_cadence(self, rid):
+        return any(kind in self.cadence for _, _, kind in self.job_actions.get(rid, ()))
+
+    def _link_jobs(self):
+        """Give each policy action that no identifier ties to anyone (e.g. an analytics profile that
+        was already anonymized) to the one case whose account-deletion job it belongs to."""
+        self.job_links = defaultdict(dict)   # case_id -> {resource: activity_id}
+        for rid in self.job_actions:
+            if self.owners.get(rid) or not self.has_cadence(rid):
+                continue
+            hits = {}
+            for cid, accts in self.account_of.items():
+                for acct in accts:
+                    aid = self.job_aligned(acct, rid)
+                    if aid:
+                        hits[cid] = aid
+            if len(hits) == 1:
+                cid, aid = hits.popitem()
+                self.job_links[cid][rid] = aid
+
     def assign_accounts(self, requests):
         """Link each deletion subject to their account.
 
-        Identifier evidence wins. Users with no identifier-linked account get the closest unclaimed
-        account deletion run by the deletion workflow between requested_at and audit_at, matched to
-        the workflow's reported_at time (the workflow's own claim names the account it acted on).
+        Identifier evidence wins. Users with no identifier-linked account get an unclaimed account
+        deletion run by the deletion workflow between requested_at and audit_at: first one whose job
+        cadence matches the subject's identifier-linked policy actions, then the one closest to the
+        workflow's reported_at time (the workflow's own claim names the account it acted on).
         """
+        if not hasattr(self, "cadence"):
+            self._index_jobs()
         self.account_of = {}
         self.assigned_by_activity = set()
         self.user_cases = defaultdict(list)
@@ -124,6 +233,9 @@ class World:
         cands = []
         for q in pending:
             req, rep, aud = parse_ts(q["requested_at"]), parse_ts(q["reported_at"]), parse_ts(q["audit_at"])
+            uid = self.resolve_user(q["email"])
+            own_actions = [r for r, us in self.owners.items() if us == {uid} and r in self.job_actions
+                           and self.has_cadence(r)]
             for a in self.activities:
                 if a["target_system"] != "account_service" or a["event_type"] != "DELETE_RECORD":
                     continue
@@ -135,16 +247,25 @@ class World:
                 # the workflow's reported status is derived from its own job result
                 consistent = STATUS_RESULT.get(q["reported_status"]) == a["reported_result"]
                 cost = abs((t - rep).total_seconds()) + (0 if consistent else 1800)
-                cands.append((cost, a["event_time"], q["case_id"], a["resource_id"]))
+                # 0: the subject's own policy actions run on this account's job cadence;
+                # 1: nothing to compare; 2: they do not, so this is someone else's job
+                if not own_actions:
+                    job = 1
+                elif any(self.job_aligned(a["resource_id"], r) for r in own_actions):
+                    job = 0
+                else:
+                    job = 2
+                cands.append((job, cost, a["event_time"], q["case_id"], a["resource_id"]))
         cands.sort()
         done = set()
-        for _, _, cid, rid in cands:
+        for _, _, _, cid, rid in cands:
             if cid in done or rid in claimed:
                 continue
             self.account_of[cid] = [rid]
             self.assigned_by_activity.add((cid, rid))
             claimed.add(rid)
             done.add(cid)
+        self._link_jobs()
 
 
 class CaseAudit:
@@ -173,6 +294,8 @@ class CaseAudit:
                 linked.setdefault(rid, aid)
         for rid in w.account_of.get(self.q["case_id"], []):
             linked.setdefault(rid, "activity-assignment")
+        for rid, aid in w.job_links.get(self.q["case_id"], {}).items():
+            linked.setdefault(rid, aid)
         # follow resource references (search doc -> source account, restore -> restored copy)
         changed = True
         while changed:
@@ -199,7 +322,8 @@ class CaseAudit:
         cases = self.w.user_cases.get(self.uid, [])
         if len(cases) < 2:
             return True
-        if (self.q["case_id"], rid) in self.w.assigned_by_activity:
+        if (self.q["case_id"], rid) in self.w.assigned_by_activity or \
+                rid in self.w.job_links.get(self.q["case_id"], {}):
             return True
         times = [o.ts or o.file_time for o in self.w.store.by_resource.get(rid, []) if o.keys & self.w.user_keys[self.uid]]
         times += [t for t, r, u, _ in self.w.catalog if r == rid and u == self.uid]

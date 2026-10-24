@@ -7,17 +7,27 @@
 Python 3.10+ (tested on 3.13). From the repository root:
 
 ```bash
-pip install -r code/requirements.txt          # pdfplumber; `anthropic` only for the optional LLM paths
+pip install -r code/requirements.txt          # pdfplumber (Gemini needs no extra package)
 python code/main.py                           # writes ./output.csv (518 rows, ~2 s, no API key needed)
 python code/evaluation/main.py --verbose      # score on the 32 labelled samples
-python code/evaluation/custom_cases.py        # 5 extra hand-built cases
+python code/evaluation/custom_cases.py        # 7 extra hand-built cases
 python code/evaluation/validate_output.py     # submission-contract checks on output.csv
 ```
 
-There are two optional, model-backed flags. Credentials come only from `ANTHROPIC_API_KEY` or `ant auth login`, and the model can be changed with `GHOST_AUDIT_MODEL` (default `claude-opus-5-5`).
+There are two optional, model-backed flags. Keys are read from the environment only. Never put one in a file
+that is committed or zipped.
 
-- `python code/main.py --llm` sends request texts the multilingual rules cannot decide to Claude.
-- `python code/main.py --refresh-vision` re-extracts the screenshot facts into `code/ghost_audit/vision_cache/`.
+| Provider | Setup | Default model |
+|---|---|---|
+| Google Gemini | `export GEMINI_API_KEY=...` (PowerShell: `$env:GEMINI_API_KEY="..."`) | `gemini-3.5-flash-lite` |
+| Anthropic Claude | `pip install anthropic` and `ANTHROPIC_API_KEY` or `ant auth login` | `claude-opus-5-5` |
+| Local model via Ollama | `ollama pull gemma4:e4b`, then `GHOST_AUDIT_PROVIDER=ollama` (no key; `OLLAMA_HOST` if not `localhost:11434`) | `gemma4:e4b` |
+
+Gemini is used when its key is set. Force a provider with `GHOST_AUDIT_PROVIDER=gemini|anthropic|ollama`, and change the model with `GHOST_AUDIT_MODEL`.
+
+- `python code/main.py --llm` makes the model label every request text (batches of 40). It decides the texts the rules cannot, and the run reports how often it agrees with the rules.
+- `python code/main.py --refresh-vision` re-extracts the screenshot facts into `code/ghost_audit/vision_cache/` (one call per image) and writes a readable `image_records.md`.
+- A full run writes `code/evaluation/usage_report.md` from the run's own token counters. The submitted `output.csv` came from `GHOST_AUDIT_PROVIDER=ollama python code/main.py --llm` (local Gemma 4). Screenshots use the verified cache, because both models we tried extracted them less accurately (see the evaluation report).
 
 ### How it works (`code/ghost_audit/`)
 
@@ -38,9 +48,11 @@ There are two optional, model-backed flags. Credentials come only from `ANTHROPI
    - resource references, such as a search document pointing to its source account or a restore that repopulated a copy;
    - as a last resort, the deletion workflow's own account activity, matched by time and by reported-status consistency.
 
+   - **deletion-job timing:** the deletion worker runs one subject's policy actions after its account deletion at a fixed cadence, so (action time − account-deletion time) mod 60 s is constant per action kind. The cadence is learned from identifier-linked pairs, or without labels from a sharp residue peak when none exist (anonymized analytics have no identifiers). It picks the right account from a deletion batch and links anonymized records to the one job they belong to.
+
    When one person filed several requests, each record goes to the request in whose window it was first seen.
 5. **State at `audit_at`:** the agent takes the latest observation from evidence captured at or before `audit_at`. Full database captures taken after the request also prove absence.
-6. **Policy and plan** (`planner.py`): each resource maps to a `deletion_rules.csv` category: DELETE, REDACT, ANONYMIZE, RETAIN, tombstone REDACT, disable the data flow, or block the restore. The case is COMPLETE only if every resource already has its required state. Steps are ordered by phase, then by operation in the specified order, then by `system_id` and `resource_id`. Findings and COMPLETE checks cite the observation that proves them; future steps carry `""`.
+6. **Policy and plan** (`planner.py`): each resource maps to a `deletion_rules.csv` category: DELETE, REDACT, ANONYMIZE, RETAIN, tombstone REDACT, disable the data flow, or block the restore. Time-bounded RETAIN conditions (retention period, active legal hold) are checked against the record's own stated end date. The case is COMPLETE only if every resource already has its required state. Steps are ordered by phase, then by operation in the specified order, then by `system_id` and `resource_id`. Findings and COMPLETE checks cite the observation that proves them; future steps carry `""`.
 
 Reports: `code/evaluation/evaluation_report.md` and `code/evaluation/usage_report.md`.
 

@@ -4,12 +4,15 @@
 Usage (from the repository root):
     python code/main.py                       # audits dataset/deletion_requests.csv -> output.csv
     python code/main.py --input sample_deletion_requests.csv --output code/evaluation/sample_predictions.csv
-    python code/main.py --llm                 # let Claude settle request texts the rules cannot decide
-    python code/main.py --refresh-vision      # re-extract screenshot facts with Claude (rewrites the cache)
+    python code/main.py --llm                 # model labels every request text (cross-check + undecidable texts)
+    python code/main.py --refresh-vision      # re-extract screenshot facts with the model (rewrites the cache)
+
+The model is Gemini when GEMINI_API_KEY is set, otherwise Claude (see code/ghost_audit/llm.py).
 """
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,15 +20,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ghost_audit.common import DATASET, REPO_ROOT, read_csv  # noqa: E402
-from ghost_audit import llm, vision  # noqa: E402
+from ghost_audit import intent, llm, vision  # noqa: E402
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", default="deletion_requests.csv", help="request file inside dataset/")
     ap.add_argument("--output", default=str(REPO_ROOT / "output.csv"))
-    ap.add_argument("--llm", action="store_true", help="use Claude for undecidable request texts")
-    ap.add_argument("--refresh-vision", action="store_true", help="re-extract screenshots with Claude")
+    ap.add_argument("--llm", action="store_true", help="label every request text with the model")
+    ap.add_argument("--refresh-vision", action="store_true", help="re-extract screenshots with the model")
     ap.add_argument("--debug", help="write per-case reasoning JSON to this path")
     ap.add_argument("--explain", metavar="CASE_ID", help="print the agent's reasoning for one case and exit")
     args = ap.parse_args(argv)
@@ -33,15 +36,19 @@ def main(argv=None):
         return explain(args.explain)
 
     started = time.time()
+    if (args.refresh_vision or args.llm) and not llm.available():
+        sys.exit("no model configured: set GEMINI_API_KEY (Gemini) or install `anthropic` and set ANTHROPIC_API_KEY")
     if args.refresh_vision:
-        if not llm.available():
-            sys.exit("--refresh-vision needs the `anthropic` package (pip install anthropic)")
         vision.refresh(sorted((DATASET / "evidence" / "images").glob("*.png")))
 
     from ghost_audit.audit import World, CaseAudit
-    world = World(use_llm=args.llm)
     # every participant-facing request helps decide which workflow run belongs to whom
     all_requests = read_csv("sample_deletion_requests.csv") + read_csv("deletion_requests.csv")
+    intent_check = None
+    if args.llm:   # label before account assignment, which depends on intent
+        intent_check = intent.classify_all([q["request_text"] for q in read_csv(args.input)])
+        print(f"intent cross-check: model agrees with rules on {intent_check['agree']}/{intent_check['labelled']} texts")
+    world = World(use_llm=args.llm)
     world.assign_accounts(all_requests)
 
     def case_order(r):   # case_33 < case_100 (numeric, matching the input file)
@@ -67,7 +74,13 @@ def main(argv=None):
     counts = {}
     for _, s, _ in rows:
         counts[s] = counts.get(s, 0) + 1
-    llm.save_usage({"requests": len(rows), "seconds": round(time.time() - started, 1), "input": args.input})
+    if args.input == "deletion_requests.csv":   # the usage report describes the run that produced output.csv
+        flags = " ".join(f for f, on in (("--llm", args.llm), ("--refresh-vision", args.refresh_vision)) if on)
+        usage = llm.save_usage({"requests": len(rows), "seconds": round(time.time() - started, 1), "input": args.input,
+                                "command": (f"GHOST_AUDIT_PROVIDER={llm.provider()} " if os.environ.get("GHOST_AUDIT_PROVIDER")
+                                            else "") + f"python code/main.py {flags}".strip(),
+                                "intent_check": intent_check})
+        llm.write_usage_report(usage)
     if world.store.errors:
         print("evidence parse errors:", *world.store.errors, sep="\n  ")
     print(f"wrote {len(rows)} rows to {out}  {counts}  model calls={llm.USAGE['calls']}")

@@ -1,8 +1,10 @@
 """Does the request text authorise deletion?
 
-Multilingual rules decide almost every request. Anything the rules cannot decide confidently
-is optionally sent to Claude (`--llm`); without a model it falls back to the rule score.
+Multilingual rules decide almost every request. With `--llm` the model (Gemini or Claude, see llm.py)
+independently labels every request text: it decides the texts the rules cannot, and its agreement with the
+rules is reported as a cross-check. Without a model, the rule score decides.
 """
+import json
 import re
 
 from . import llm
@@ -51,9 +53,51 @@ LLM_SYSTEM = ("You classify customer privacy requests. Answer with exactly one w
               "marketing opt-out, login help, etc.).")
 
 
+BATCH_SYSTEM = ("You classify customer privacy requests, written in any language. DELETE means the customer asks "
+                "to delete, erase or close their account or personal data (including asking to verify or finish an "
+                "earlier deletion). OTHER means anything else: access, export or a copy of data, correction, "
+                "marketing opt-out, login help, or a request that explicitly says not to delete.")
+BATCH_PROMPT = ("Classify each request below. Return ONLY a JSON object mapping every id to \"DELETE\" or "
+                 "\"OTHER\", for example {\"r0\": \"DELETE\", \"r1\": \"OTHER\"}.\n\n")
+BATCH_SIZE = 40
+
+LLM_LABELS = {}   # request text -> True (deletion) / False, from classify_all()
+
+
+def classify_all(texts):
+    """Label every distinct text with the model, in batches. Returns a cross-check summary of model
+    labels vs the rules. Rules still decide the texts they are confident about (see authorises_deletion)."""
+    uniq = sorted(set(texts))
+    for i in range(0, len(uniq), BATCH_SIZE):
+        chunk = uniq[i:i + BATCH_SIZE]
+        prompt = BATCH_PROMPT + "\n".join(f"r{j}: {json.dumps(t, ensure_ascii=False)}" for j, t in enumerate(chunk))
+        answer = llm.complete([{"type": "text", "text": prompt}], max_tokens=64 * len(chunk) + 2048,
+                              purpose="intent", system=BATCH_SYSTEM, json_mode=True)
+        m = re.search(r"\{.*\}", answer or "", re.S)
+        try:
+            labels = json.loads(m.group(0)) if m else {}
+        except ValueError:
+            labels = {}
+        for j, t in enumerate(chunk):
+            v = str(labels.get(f"r{j}", "")).upper()
+            if v in ("DELETE", "OTHER"):
+                LLM_LABELS[t] = v == "DELETE"
+    labelled = [t for t in uniq if t in LLM_LABELS]
+    disagree = [{"text": t[:160], "rules": rule_decision(t)[0], "model": LLM_LABELS[t]}
+                for t in labelled if rule_decision(t)[0] != LLM_LABELS[t]]
+    n = len(labelled)
+    return {"texts": len(uniq), "labelled": n, "agree": n - len(disagree),
+            "agree_rate": (n - len(disagree)) / n if n else 0.0, "disagree": len(disagree),
+            "disagreements": disagree}
+
+
 def authorises_deletion(text, use_llm=False):
     decision, confident = rule_decision(text)
-    if confident or not use_llm or not llm.available():
+    if confident:
+        return decision
+    if text in LLM_LABELS:
+        return LLM_LABELS[text]
+    if not use_llm or not llm.available():
         return decision
     answer = llm.complete([{"type": "text", "text": text}], max_tokens=256, purpose="intent", system=LLM_SYSTEM)
     if "DELETE" in (answer or "").upper():

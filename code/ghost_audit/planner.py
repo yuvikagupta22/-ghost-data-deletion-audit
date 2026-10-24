@@ -73,13 +73,31 @@ def category(rid, hints):
     return None
 
 
-def treatment(cat, rules):
+# RETAIN rules whose condition is a time-bounded period ("within the supplied retention period",
+# "a supplied legal hold is active"): once the record's own stated end has passed, nothing requires
+# keeping it any more and it is deleted like any other personal record.
+TIME_BOUNDED_RETAIN = {"SECURITY_AUDIT_LOG", "LEGAL_HOLD_RECORD"}
+
+
+def retention_lapsed(rid, case):
+    """True when the evidence visible at audit_at shows the record's retention/hold already ended."""
+    ends = [o.retain_until for o in case.w.store.by_resource.get(rid, [])
+            if case.visible(o) and getattr(o, "retain_until", None)]
+    return bool(ends) and max(ends) < case.audit_at
+
+
+def treatment(cat, rules, rid=None, case=None):
     if cat == "DATA_FLOW":
         return "DISABLE"
     if cat == "BACKUP_ARCHIVE":
+        # rule_14 retains the archive itself; its condition ("restore access can be blocked") is
+        # what the plan must enforce, so the step is about the restore path, not the archive
         return "BLOCK"
     for r in rules:
         if r["data_category"] == cat:
+            if r["required_action"] == "RETAIN" and cat in TIME_BOUNDED_RETAIN and case is not None \
+                    and retention_lapsed(rid, case):
+                return "DELETE"
             return r["required_action"]
     return None
 
@@ -92,7 +110,7 @@ def build_steps(resources, world, case):
         info = resources[rid]
         latest = info["latest"]
         cat = category(rid, info["hints"])
-        treat = treatment(cat, world.rules)
+        treat = treatment(cat, world.rules, rid, case)
         if not treat:
             continue
         if latest is None:

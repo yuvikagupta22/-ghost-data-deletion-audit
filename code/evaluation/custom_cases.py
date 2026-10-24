@@ -155,6 +155,49 @@ def workflow_claim_does_not_prove_deletion():
     return make_world(ids, [], acts, o, [q]), q, expected
 
 
+def worker(aid, ts, rid, details, event="ANONYMIZE_RECORD", result="SUCCESS"):
+    from ghost_audit.common import system_of
+    return {"activity_id": aid, "event_time": ts, "event_type": event, "source_system": "deletion_worker",
+            "target_system": system_of(rid), "resource_id": rid, "reported_result": result, "details": details}
+
+
+@case
+def deletion_job_timing_links_anonymized_analytics():
+    """An anonymized analytics profile carries no identifier; only its deletion job ties it to the subject.
+    Four jobs teach the cadence (+29m41s after the account deletion); an off-cadence decoy is ignored."""
+    ids = [ident("user_950", "job@example.com")]
+    acts, o = [], []
+    for i, day in enumerate(("2026-09-02", "2026-09-04", "2026-09-06", "2026-09-08")):
+        acct, ana = f"account_95{i}0", f"analytics_95{i}1"
+        acts.append(worker(f"act_d{i}", f"{day}T11:01:53Z", acct,
+                           f"Deletion worker submitted primary profile {acct} to account_service.", "DELETE_RECORD"))
+        acts.append(worker(f"act_a{i}", f"{day}T11:31:34Z", ana, f"Policy action completed for {ana}."))
+    # someone else's anonymization in the same window, off the cadence
+    acts.append(worker("act_x", "2026-09-02T11:44:02Z", "analytics_9599", "Policy action completed for analytics_9599."))
+    o = [obs("ev_f", "2026-09-20T10:00:00Z", "account_9500", "ABSENT", ["email:job@example.com"]),
+         obs("ev_f", "2026-09-20T10:00:00Z", "analytics_9501", "ANONYMIZED", []),
+         obs("ev_f", "2026-09-20T10:00:00Z", "analytics_9599", "ANONYMIZED", [])]
+    q = req("custom_6", "job@example.com", "Please delete my account and all my data.")
+    expected = ("COMPLETE", [("V", "account_9500", "VERIFY_RECORD_ABSENT", "ev_f"),
+                             ("V", "analytics_9501", "VERIFY_RECORD_ANONYMIZED", "ev_f")])
+    return make_world(ids, [], acts, o, [q]), q, expected
+
+
+@case
+def lapsed_retention_is_no_longer_retained():
+    """rule_12 retains security audit records only within the retention period; this one's has ended."""
+    ids = [ident("user_960", "retain@example.com")]
+    o = [obs("ev_g", "2026-09-20T10:00:00Z", "account_9601", "ABSENT", ["email:retain@example.com"]),
+         obs("ev_g", "2026-09-20T10:00:00Z", "audit_record_9602", "PRESENT", ["uid:user_960"])]
+    o[1].retain_until = parse_ts("2026-06-30T23:59:59Z")
+    q = req("custom_7", "retain@example.com", "Delete my account please.")
+    expected = ("INCOMPLETE", [("F", "audit_record_9602", "REPORT_REMAINING_RECORD", "ev_g"),
+                               ("R", "audit_record_9602", "DELETE_RECORD", ""),
+                               ("V", "account_9601", "VERIFY_RECORD_ABSENT", ""),
+                               ("V", "audit_record_9602", "VERIFY_RECORD_ABSENT", "")])
+    return make_world(ids, [], [], o, [q]), q, expected
+
+
 def run():
     passed = 0
     rows = []
